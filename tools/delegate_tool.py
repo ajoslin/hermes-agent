@@ -1213,6 +1213,8 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    # Effective delegation config after applying a selected named route.
+    delegation_cfg: Optional[Dict[str, Any]] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1246,7 +1248,7 @@ def _build_child_agent(
     parent_subagent_id = getattr(parent_agent, "_subagent_id", None)
     tui_depth = max(0, child_depth - 1)  # 0 = first-level child for the UI
 
-    delegation_cfg = _load_config()
+    delegation_cfg = delegation_cfg if delegation_cfg is not None else _load_config()
 
     # When no explicit toolsets given, inherit from parent's enabled toolsets
     # so disabled tools (e.g. web) don't leak to subagents.
@@ -2776,6 +2778,68 @@ def _recover_tasks_from_json_string(
     return parsed, None
 
 
+def _resolve_delegation_route(cfg: dict, route: Optional[str]) -> dict:
+    """Return delegation config with the selected named route overlaid."""
+    selected = route
+    if selected is None and "default_route" in cfg:
+        selected = cfg.get("default_route")
+
+    if selected is None:
+        return cfg
+    if not isinstance(selected, str) or not selected.strip():
+        source = "route" if route is not None else "delegation.default_route"
+        raise ValueError(f"{source} must be a non-empty string.")
+    selected = selected.strip()
+
+    routes = cfg.get("routes")
+    if not isinstance(routes, dict):
+        raise ValueError(
+            f"Delegation route '{selected}' cannot be resolved because "
+            "delegation.routes must be an object."
+        )
+    if selected not in routes:
+        raise ValueError(f"Unknown delegation route '{selected}'.")
+
+    route_cfg = routes[selected]
+    if not isinstance(route_cfg, dict):
+        raise ValueError(f"Delegation route '{selected}' must be an object.")
+
+    allowed_fields = {"model", "provider", "reasoning_effort"}
+    unknown_fields = sorted(
+        str(field) for field in route_cfg if field not in allowed_fields
+    )
+    if unknown_fields:
+        raise ValueError(
+            f"Delegation route '{selected}' contains unsupported field(s): "
+            + ", ".join(unknown_fields)
+            + ". Only model, provider, and reasoning_effort are allowed."
+        )
+
+    for field in ("model", "provider"):
+        if field in route_cfg and (
+            not isinstance(route_cfg[field], str) or not route_cfg[field].strip()
+        ):
+            raise ValueError(
+                f"delegation.routes.{selected}.{field} must be a non-empty string."
+            )
+
+    if "reasoning_effort" in route_cfg:
+        from hermes_constants import parse_reasoning_effort
+
+        if parse_reasoning_effort(route_cfg["reasoning_effort"]) is None:
+            raise ValueError(
+                f"delegation.routes.{selected}.reasoning_effort is invalid: "
+                f"{route_cfg['reasoning_effort']!r}."
+            )
+
+    effective = dict(cfg)
+    if "provider" in route_cfg:
+        for field in ("base_url", "api_key", "api_mode"):
+            effective.pop(field, None)
+    effective.update(route_cfg)
+    return effective
+
+
 def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
@@ -2784,6 +2848,7 @@ def delegate_task(
     role: Optional[str] = None,
     background: Optional[bool] = None,
     parent_agent=None,
+    route: Optional[str] = None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks.
@@ -2840,8 +2905,12 @@ def delegate_task(
             }
         )
 
-    # Load config
+    # Load config and resolve one call-level route before any child is built.
     cfg = _load_config()
+    try:
+        cfg = _resolve_delegation_route(cfg, route)
+    except ValueError as exc:
+        return tool_error(str(exc))
     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
     # Model-supplied max_iterations is ignored — the config value is authoritative
     # so users get predictable budgets. The kwarg is retained for internal callers
@@ -2965,6 +3034,7 @@ def delegate_task(
             override_acp_command=creds.get("command"),
             override_acp_args=creds.get("args"),
             role=effective_role,
+            delegation_cfg=cfg,
         )
         # Tee the child's progress events into its live transcript log.
         # wrap_progress_callback preserves the inner callback contract
@@ -3871,6 +3941,13 @@ DELEGATE_TASK_SCHEMA = {
                     "specific you are, the better the subagent performs."
                 ),
             },
+            "route": {
+                "type": "string",
+                "description": (
+                    "Optional named route from delegation.routes. The selected "
+                    "route applies to every child in this call, including batches."
+                ),
+            },
             "tasks": {
                 "type": "array",
                 "items": {
@@ -3968,6 +4045,7 @@ registry.register(
         goal=args.get("goal"),
         context=args.get("context"),
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
+        route=args.get("route"),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")),

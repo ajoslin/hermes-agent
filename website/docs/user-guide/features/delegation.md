@@ -140,18 +140,67 @@ process disappears while it is still running is recorded as `unknown`, because
 Hermes cannot prove whether its external side effects happened. Pending and
 delivered records are bounded and profile-local.
 
-## Model Override
+## Model Override and Named Routes
 
-You can configure a different model for subagents via `config.yaml` — useful for delegating simple tasks to cheaper/faster models:
+You can configure a default model and provider for all subagents via `config.yaml`:
 
 ```yaml
 # In ~/.hermes/config.yaml
 delegation:
   model: "google/gemini-flash-2.0"    # Cheaper model for subagents
-  provider: "openrouter"              # Optional: route subagents to a different provider
+  provider: "openrouter"              # Optional: use a different provider
+  reasoning_effort: low                # Optional: override parent reasoning
 ```
 
-If omitted, subagents use the same model as the parent.
+If these values are omitted, subagents inherit them from the parent.
+
+For call-level selection, define user-named routes under `delegation.routes`.
+Each route may set only `model`, `provider`, and `reasoning_effort`:
+
+```yaml
+# In ~/.hermes/config.yaml
+delegation:
+  model: "anthropic/claude-sonnet-4"
+  provider: "openrouter"
+  reasoning_effort: medium
+  default_route: quick
+  routes:
+    quick:
+      model: "google/gemini-flash-2.0"
+      reasoning_effort: low
+    deep-review:
+      model: "anthropic/claude-opus-4"
+      reasoning_effort: high
+```
+
+Select a route with the single optional, call-level `route` parameter:
+
+```python
+delegate_task(
+    goal="Review the authentication changes",
+    route="deep-review"
+)
+```
+
+The selected route applies to every child in the call. Do not put `route` in
+individual task objects:
+
+```python
+delegate_task(
+    tasks=[
+        {"goal": "Review the API changes"},
+        {"goal": "Review the database migration"},
+    ],
+    route="deep-review"
+)
+```
+
+A route overrides the top-level delegation values it defines. Missing route
+fields inherit the top-level `delegation.model`, `delegation.provider`, and
+`delegation.reasoning_effort`, then the existing parent behavior. When `route`
+is omitted, Hermes uses `delegation.default_route` if configured. With neither
+a call route nor a default route, delegation behaves as before. Unknown or
+invalid selected routes fail before any child starts.
 
 ## Inherited Tool Access
 

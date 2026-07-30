@@ -11,6 +11,7 @@ Run with:  python -m pytest tests/test_delegate.py -v
 
 import json
 import os
+import tempfile
 import threading
 import time
 import types
@@ -71,6 +72,14 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("goal", props)
         self.assertIn("tasks", props)
         self.assertIn("context", props)
+        self.assertEqual(props["route"]["type"], "string")
+        self.assertNotIn("route", props["tasks"]["items"]["properties"])
+        for hidden_routing_field in ("model", "provider", "reasoning_effort"):
+            self.assertNotIn(hidden_routing_field, props)
+            self.assertNotIn(
+                hidden_routing_field,
+                props["tasks"]["items"]["properties"],
+            )
         # toolsets is intentionally NOT exposed to the model — subagents always
         # inherit the parent's toolsets. Letting the model name toolsets was a
         # capability-selection surface the model should not control.
@@ -1227,6 +1236,217 @@ class TestBlockedTools(unittest.TestCase):
         self.assertEqual(_get_max_spawn_depth(), 1)       # default: flat
         self.assertTrue(_get_orchestrator_enabled())      # default
         self.assertEqual(_MIN_SPAWN_DEPTH, 1)
+
+
+class TestDelegationRoutes(unittest.TestCase):
+    def _invoke_with_config(self, config_text, **delegate_kwargs):
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = os.path.join(tmp, "config.yaml")
+            with open(config_path, "w", encoding="utf-8") as config_file:
+                config_file.write(config_text)
+
+            token = set_hermes_home_override(tmp)
+            try:
+                parent = _make_mock_parent()
+                parent._credential_pool = None
+                parent.reasoning_config = {"enabled": True, "effort": "medium"}
+
+                def make_child(**kwargs):
+                    child = MagicMock()
+                    child.model = kwargs["model"]
+                    child.run_conversation.return_value = {
+                        "final_response": "done",
+                        "completed": True,
+                        "api_calls": 1,
+                        "messages": [],
+                    }
+                    return child
+
+                with patch.dict(
+                    os.environ, {"OPENROUTER_API_KEY": "test-key"}, clear=False
+                ):
+                    with patch("run_agent.AIAgent", side_effect=make_child) as MockAgent:
+                        result = json.loads(
+                            delegate_task(parent_agent=parent, **delegate_kwargs)
+                        )
+                        calls = list(MockAgent.call_args_list)
+            finally:
+                reset_hermes_home_override(token)
+
+        return result, calls
+
+    def test_direct_route_uses_configured_model_provider_and_reasoning(self):
+        result, calls = self._invoke_with_config(
+            "delegation:\n"
+            "  model: top-level-model\n"
+            "  provider: nous\n"
+            "  reasoning_effort: low\n"
+            "  routes:\n"
+            "    review:\n"
+            "      model: routed-model\n"
+            "      provider: openrouter\n"
+            "      reasoning_effort: high\n",
+            goal="Review this",
+            route="review",
+        )
+
+        self.assertEqual(result["results"][0]["status"], "completed")
+        call_kwargs = calls[0].kwargs
+        self.assertEqual(call_kwargs["model"], "routed-model")
+        self.assertEqual(call_kwargs["provider"], "openrouter")
+        self.assertEqual(
+            call_kwargs["reasoning_config"],
+            {"enabled": True, "effort": "high"},
+        )
+
+    def test_route_provider_overrides_top_level_direct_endpoint(self):
+        _, calls = self._invoke_with_config(
+            "delegation:\n"
+            "  base_url: https://direct.example/v1\n"
+            "  api_key: direct-key\n"
+            "  api_mode: anthropic_messages\n"
+            "  routes:\n"
+            "    review:\n"
+            "      model: routed-model\n"
+            "      provider: openrouter\n",
+            goal="Review this",
+            route="review",
+        )
+
+        call_kwargs = calls[0].kwargs
+        self.assertEqual(call_kwargs["model"], "routed-model")
+        self.assertEqual(call_kwargs["provider"], "openrouter")
+        self.assertEqual(call_kwargs["base_url"], "https://openrouter.ai/api/v1")
+        self.assertEqual(call_kwargs["api_key"], "test-key")
+        self.assertEqual(call_kwargs["api_mode"], "chat_completions")
+
+    def test_model_only_route_inherits_top_level_direct_endpoint(self):
+        _, calls = self._invoke_with_config(
+            "delegation:\n"
+            "  base_url: https://direct.example/v1\n"
+            "  api_key: direct-key\n"
+            "  api_mode: anthropic_messages\n"
+            "  routes:\n"
+            "    review:\n"
+            "      model: routed-model\n",
+            goal="Review this",
+            route="review",
+        )
+
+        call_kwargs = calls[0].kwargs
+        self.assertEqual(call_kwargs["model"], "routed-model")
+        self.assertEqual(call_kwargs["provider"], "custom")
+        self.assertEqual(call_kwargs["base_url"], "https://direct.example/v1")
+        self.assertEqual(call_kwargs["api_key"], "direct-key")
+        self.assertEqual(call_kwargs["api_mode"], "anthropic_messages")
+
+    def test_omitted_route_uses_default_and_inherits_top_level_fields(self):
+        _, calls = self._invoke_with_config(
+            "delegation:\n"
+            "  provider: openrouter\n"
+            "  reasoning_effort: low\n"
+            "  default_route: quick\n"
+            "  routes:\n"
+            "    quick:\n"
+            "      model: routed-model\n",
+            goal="Use the default",
+        )
+
+        call_kwargs = calls[0].kwargs
+        self.assertEqual(call_kwargs["model"], "routed-model")
+        self.assertEqual(call_kwargs["provider"], "openrouter")
+        self.assertEqual(
+            call_kwargs["reasoning_config"],
+            {"enabled": True, "effort": "low"},
+        )
+
+    def test_batch_uses_one_call_level_route_for_every_child(self):
+        _, calls = self._invoke_with_config(
+            "delegation:\n"
+            "  routes:\n"
+            "    batch-route:\n"
+            "      model: batch-model\n"
+            "      provider: openrouter\n"
+            "      reasoning_effort: high\n",
+            tasks=[{"goal": "One"}, {"goal": "Two"}],
+            route="batch-route",
+        )
+
+        self.assertEqual(len(calls), 2)
+        for call in calls:
+            self.assertEqual(call.kwargs["model"], "batch-model")
+            self.assertEqual(call.kwargs["provider"], "openrouter")
+            self.assertEqual(
+                call.kwargs["reasoning_config"],
+                {"enabled": True, "effort": "high"},
+            )
+
+    def test_invalid_selected_routes_fail_before_child_construction(self):
+        cases = {
+            "unknown": (
+                "delegation:\n  routes:\n    known:\n      model: okay\n",
+                "missing",
+                "Unknown delegation route",
+            ),
+            "malformed routes": (
+                "delegation:\n  routes: nope\n",
+                "named",
+                "delegation.routes must be an object",
+            ),
+            "malformed route": (
+                "delegation:\n  routes:\n    named: nope\n",
+                "named",
+                "must be an object",
+            ),
+            "unsupported field": (
+                "delegation:\n  routes:\n    named:\n      base_url: https://example.com\n",
+                "named",
+                "unsupported field",
+            ),
+            "invalid model": (
+                "delegation:\n  routes:\n    named:\n      model: 42\n",
+                "named",
+                "model must be a non-empty string",
+            ),
+            "invalid provider": (
+                "delegation:\n  routes:\n    named:\n      provider: ''\n",
+                "named",
+                "provider must be a non-empty string",
+            ),
+            "invalid reasoning": (
+                "delegation:\n  routes:\n    named:\n      reasoning_effort: impossible\n",
+                "named",
+                "reasoning_effort is invalid",
+            ),
+        }
+        for label, (config, route, expected_error) in cases.items():
+            with self.subTest(label=label):
+                result, calls = self._invoke_with_config(
+                    config,
+                    goal="Must not start",
+                    route=route,
+                )
+                self.assertEqual(calls, [])
+                self.assertIn(expected_error, result["error"])
+
+    def test_no_route_configuration_preserves_existing_parent_inheritance(self):
+        _, calls = self._invoke_with_config(
+            "delegation:\n  max_iterations: 50\n",
+            goal="Use existing behavior",
+        )
+
+        call_kwargs = calls[0].kwargs
+        self.assertEqual(call_kwargs["model"], "anthropic/claude-sonnet-4")
+        self.assertEqual(call_kwargs["provider"], "openrouter")
+        self.assertEqual(
+            call_kwargs["reasoning_config"],
+            {"enabled": True, "effort": "medium"},
+        )
 
 
 class TestDelegationCredentialResolution(unittest.TestCase):
@@ -2462,6 +2682,7 @@ class TestDispatchDelegateTask(unittest.TestCase):
                 parent,
                 {
                     "goal": "test",
+                    "route": "review",
                     "acp_command": "claude",
                     "acp_args": ["--acp", "--stdio"],
                     "tasks": [
@@ -2477,8 +2698,27 @@ class TestDispatchDelegateTask(unittest.TestCase):
         self.assertNotIn("acp_command", captured)
         self.assertNotIn("acp_args", captured)
         self.assertEqual(captured["goal"], "test")
+        self.assertEqual(captured["route"], "review")
         self.assertNotIn("acp_command", captured["tasks"][0])
         self.assertNotIn("acp_args", captured["tasks"][0])
+
+    def test_registry_fallback_forwards_call_level_route(self):
+        from tools.registry import registry
+
+        captured = {}
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        parent = _make_mock_parent(depth=0)
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            registry._tools["delegate_task"].handler(
+                {"goal": "test", "route": "review"},
+                parent_agent=parent,
+            )
+
+        self.assertEqual(captured["route"], "review")
 
 class TestDelegateEventEnum(unittest.TestCase):
     """Tests for DelegateEvent enum and back-compat aliases."""
