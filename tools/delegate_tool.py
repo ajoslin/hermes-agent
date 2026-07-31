@@ -8,7 +8,7 @@ modes. Top-level model calls run in the background; orchestrator children
 wait for their own workers so they can synthesize the results.
 
 Each child gets:
-  - A fresh conversation (no parent history)
+  - Fresh context by default, or explicitly/route-selected fork history
   - Its own task_id (own terminal session, file ops cache)
   - The parent's toolsets, with child-only blocked tools stripped
   - A focused system prompt built from the delegated goal + context
@@ -17,6 +17,7 @@ The parent's context only sees the delegation call and the summary result,
 never the child's intermediate tool calls or reasoning.
 """
 
+import copy
 import enum
 import contextvars
 import json
@@ -802,13 +803,10 @@ def _build_child_system_prompt(
     The depth note is literal truth (grounded in the passed config) so
     the LLM doesn't confabulate nesting capabilities that don't exist.
     """
-    parts = [
-        "You are a focused subagent working on a specific delegated task.",
-        "",
-        f"YOUR TASK:\n{goal}",
-    ]
-    if context and context.strip():
-        parts.append(f"\nCONTEXT:\n{context}")
+    # Goal and context deliberately live in the final user packet, not here.
+    # Keeping one role/tool-contract prompt across tasks preserves a stable
+    # provider-neutral cache prefix for fresh and forked children alike.
+    parts = ["You are a focused subagent working on a delegated task."]
     if workspace_path and str(workspace_path).strip():
         parts.append(
             "\nWORKSPACE PATH:\n"
@@ -861,6 +859,183 @@ def _build_child_system_prompt(
             f"is capped at max_spawn_depth={max_spawn_depth}. {child_note}"
         )
     return "\n".join(parts)
+
+
+def _parse_fork_turns(value: Any, source: str) -> Optional[str]:
+    """Normalize a model/config fork selector; empty means keep resolving."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(
+            f"{source} must be a string: 'none', 'all', or a positive integer."
+        )
+    normalized = value.strip().lower()
+    if not normalized:
+        return None
+    if normalized in {"none", "all"}:
+        return normalized
+    if normalized.isdecimal() and int(normalized) > 0:
+        return str(int(normalized))
+    raise ValueError(
+        f"{source} must be 'none', 'all', or a positive integer string; got {value!r}."
+    )
+
+
+def _resolve_fork_turns(
+    task_value: Any,
+    call_value: Any,
+    route_value: Any,
+    *,
+    task_index: int,
+) -> str:
+    """Apply task > call > route > compatibility-fresh precedence."""
+    candidates = (
+        (task_value, f"Task {task_index} fork_turns"),
+        (call_value, "fork_turns"),
+        (route_value, "selected route default_fork"),
+    )
+    for value, source in candidates:
+        parsed = _parse_fork_turns(value, source)
+        if parsed is not None:
+            return parsed
+    return "none"
+
+
+def _visible_fork_message(message: Any) -> bool:
+    if not isinstance(message, dict):
+        return False
+    # Timeline/control rows are model-facing in the parent but are not part of
+    # the visible semantic conversation a child may inherit. Trigger-style
+    # synthesized inputs such as auto_continue remain eligible when they
+    # complete a normal user/assistant turn.
+    if message.get("display_kind") in {
+        "hidden",
+        "model_switch",
+        "async_delegation_complete",
+    }:
+        return False
+    if message.get("hidden") is True or message.get("internal_only") is True:
+        return False
+    from agent.message_eligibility import is_ephemeral_scaffolding
+
+    return not is_ephemeral_scaffolding(message)
+
+
+def _copy_fork_message(
+    message: Dict[str, Any], *, compaction_summary: bool = False
+) -> Optional[Dict[str, Any]]:
+    """Copy only model-visible bytes from one eligible parent message."""
+    from agent.message_eligibility import is_completed_assistant_message
+
+    role = message.get("role")
+    content = message.get("content")
+    if role == "user":
+        if not isinstance(content, (str, list)) or not content:
+            return None
+    elif role == "assistant":
+        if not compaction_summary and not is_completed_assistant_message(message):
+            return None
+        if message.get("tool_calls") or not isinstance(content, str) or not content.strip():
+            return None
+    else:
+        return None
+    copied: Dict[str, Any] = {"role": role, "content": copy.deepcopy(content)}
+    api_content = message.get("api_content")
+    if isinstance(api_content, str) and api_content:
+        copied["api_content"] = api_content
+    return copied
+
+
+def _project_fork_history(messages: Any, selector: str) -> List[Dict[str, Any]]:
+    """Project completed visible semantic turns without mutating the parent."""
+    if selector == "none" or not isinstance(messages, list):
+        return []
+
+    from agent.context_compressor import is_compaction_summary_message
+
+    include_compacted_baseline = selector == "all"
+    turn_count = None if include_compacted_baseline else int(selector)
+    turns: List[List[Dict[str, Any]]] = []
+    pending_user: Optional[Dict[str, Any]] = None
+    for original in messages:
+        is_compacted = is_compaction_summary_message(original)
+        if not _visible_fork_message(original) and not (
+            include_compacted_baseline and is_compacted
+        ):
+            # Internal/control rows do not consume or replace the surrounding
+            # genuine user boundary. A later terminal answer can still close
+            # that semantic turn after verification/recovery scaffolding.
+            continue
+        if is_compacted and not include_compacted_baseline:
+            # Numeric selectors count only independently provable turns. A
+            # content-only SessionDB-reloaded summary is still not a turn.
+            pending_user = None
+            continue
+        copied = _copy_fork_message(original, compaction_summary=is_compacted)
+        if copied is None:
+            # Tool calls and incomplete/interim assistant text do not complete
+            # the pending turn. Keep its genuine user until either a terminal
+            # assistant closes it or a later eligible user replaces it.
+            continue
+        if copied["role"] == "user":
+            pending_user = copied
+            continue
+        if pending_user is not None:
+            turns.append([pending_user, copied])
+            pending_user = None
+            continue
+        if is_compacted:
+            # A summary is the all-mode baseline. Keep it at its effective-
+            # context position. If the preceding retained boundary is also an
+            # assistant, drop that boundary message (not the summary bytes and
+            # not chronology) before appending the baseline.
+            if turns and turns[-1][-1]["role"] == "assistant":
+                turns[-1].pop()
+                if not turns[-1]:
+                    turns.pop()
+            if turns and turns[-1][-1]["role"] == "user":
+                turns[-1].append(copied)
+            else:
+                turns.append([copied])
+
+    selected_turns = turns if turn_count is None else turns[-turn_count:]
+    projected = [message for turn in selected_turns for message in turn]
+    # Construction above only emits completed user/assistant pairs plus an
+    # optional assistant summary baseline, so no defensive role repair is used.
+    return projected
+
+
+def _build_child_task_message(
+    goal: str,
+    context: Optional[str] = None,
+    active_request: Any = None,
+) -> Any:
+    """Build the one task-specific final user message for every fork mode."""
+    sections: List[str] = []
+    if isinstance(active_request, str) and active_request:
+        sections.append(f"ACTIVE USER REQUEST:\n{active_request}")
+    sections.append(f"DELEGATED GOAL:\n{goal}")
+    if isinstance(context, str) and context.strip():
+        sections.append(f"EXPLICIT CONTEXT:\n{context}")
+    task_text = "\n\n".join(sections)
+    if isinstance(active_request, list):
+        content = copy.deepcopy(active_request)
+        content.append({"type": "text", "text": task_text})
+        return content
+    return task_text
+
+
+def _parent_fork_snapshot(parent_agent) -> tuple[List[Dict[str, Any]], Any]:
+    """Copy effective parent history and identify its active visible request."""
+    parent_state = getattr(parent_agent, "__dict__", {})
+    raw = parent_state.get("_session_messages")
+    snapshot = copy.deepcopy(raw) if isinstance(raw, list) else []
+    active = parent_state.get("_active_delegate_user_message")
+    if active is None and snapshot:
+        last = snapshot[-1]
+        if isinstance(last, dict) and last.get("role") == "user":
+            active = copy.deepcopy(last.get("content"))
+    return snapshot, copy.deepcopy(active)
 
 
 def _resolve_workspace_hint(parent_agent) -> Optional[str]:
@@ -2181,7 +2356,10 @@ def _run_single_child(
 
             with delegated_child_context():
                 return child.run_conversation(
-                    user_message=goal,
+                    user_message=getattr(child, "_delegate_task_message", goal),
+                    conversation_history=getattr(
+                        child, "_delegate_conversation_history", None
+                    ),
                     task_id=child_task_id,
                     stream_callback=_relay_child_text,
                 )
@@ -2780,12 +2958,16 @@ def _recover_tasks_from_json_string(
 
 def _resolve_delegation_route(cfg: dict, route: Optional[str]) -> dict:
     """Return delegation config with the selected named route overlaid."""
+    # Fork defaults exist only inside named routes.  Do not let an unknown or
+    # stale top-level delegation.default_fork become a global behavior switch.
+    effective_base = dict(cfg)
+    effective_base.pop("default_fork", None)
     selected = route
     if selected is None and "default_route" in cfg:
         selected = cfg.get("default_route")
 
     if selected is None:
-        return cfg
+        return effective_base
     if not isinstance(selected, str) or not selected.strip():
         source = "route" if route is not None else "delegation.default_route"
         raise ValueError(f"{source} must be a non-empty string.")
@@ -2804,7 +2986,7 @@ def _resolve_delegation_route(cfg: dict, route: Optional[str]) -> dict:
     if not isinstance(route_cfg, dict):
         raise ValueError(f"Delegation route '{selected}' must be an object.")
 
-    allowed_fields = {"model", "provider", "reasoning_effort"}
+    allowed_fields = {"model", "provider", "reasoning_effort", "default_fork"}
     unknown_fields = sorted(
         str(field) for field in route_cfg if field not in allowed_fields
     )
@@ -2812,7 +2994,7 @@ def _resolve_delegation_route(cfg: dict, route: Optional[str]) -> dict:
         raise ValueError(
             f"Delegation route '{selected}' contains unsupported field(s): "
             + ", ".join(unknown_fields)
-            + ". Only model, provider, and reasoning_effort are allowed."
+            + ". Only model, provider, reasoning_effort, and default_fork are allowed."
         )
 
     for field in ("model", "provider"):
@@ -2832,7 +3014,19 @@ def _resolve_delegation_route(cfg: dict, route: Optional[str]) -> dict:
                 f"{route_cfg['reasoning_effort']!r}."
             )
 
-    effective = dict(cfg)
+    if "default_fork" in route_cfg:
+        parsed_default = _parse_fork_turns(
+            route_cfg["default_fork"],
+            f"delegation.routes.{selected}.default_fork",
+        )
+        if parsed_default is None:
+            raise ValueError(
+                f"delegation.routes.{selected}.default_fork must not be empty."
+            )
+        route_cfg = dict(route_cfg)
+        route_cfg["default_fork"] = parsed_default
+
+    effective = effective_base
     if "provider" in route_cfg:
         for field in ("base_url", "api_key", "api_mode"):
             effective.pop(field, None)
@@ -2849,6 +3043,7 @@ def delegate_task(
     background: Optional[bool] = None,
     parent_agent=None,
     route: Optional[str] = None,
+    fork_turns: Optional[str] = None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks.
@@ -2954,14 +3149,22 @@ def delegate_task(
             )
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
-        task_list = [{"goal": goal, "context": context, "role": top_role}]
+        task_list = [
+            {
+                "goal": goal,
+                "context": context,
+                "role": top_role,
+            }
+        ]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
 
     if not task_list:
         return tool_error("No tasks provided.")
 
-    # Validate each task has a goal
+    # Validate each task and resolve fork precedence before constructing any
+    # children, so a bad mixed-batch selector fails atomically.
+    resolved_forks: List[str] = []
     for i, task in enumerate(task_list):
         if not isinstance(task, dict):
             return tool_error(
@@ -2969,6 +3172,19 @@ def delegate_task(
             )
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+        try:
+            resolved_forks.append(
+                _resolve_fork_turns(
+                    task.get("fork_turns"),
+                    fork_turns,
+                    cfg.get("default_fork"),
+                    task_index=i,
+                )
+            )
+        except ValueError as exc:
+            return tool_error(str(exc))
+
+    parent_snapshot, active_request = _parent_fork_snapshot(parent_agent)
 
     overall_start = time.monotonic()
     results = []
@@ -3035,6 +3251,12 @@ def delegate_task(
             override_acp_args=creds.get("args"),
             role=effective_role,
             delegation_cfg=cfg,
+        )
+        child._delegate_conversation_history = _project_fork_history(
+            parent_snapshot, resolved_forks[i]
+        )
+        child._delegate_task_message = _build_child_task_message(
+            t["goal"], t.get("context"), active_request
         )
         # Tee the child's progress events into its live transcript log.
         # wrap_progress_callback preserves the inner callback contract
@@ -3929,8 +4151,9 @@ DELEGATE_TASK_SCHEMA = {
                 "type": "string",
                 "description": (
                     "What the subagent should accomplish. Be specific and "
-                    "self-contained -- the subagent knows nothing about your "
-                    "conversation history."
+                    "self-contained. A fresh child receives no history; an "
+                    "explicit or route-selected fork may inherit sanitized "
+                    "parent turns."
                 ),
             },
             "context": {
@@ -3948,6 +4171,15 @@ DELEGATE_TASK_SCHEMA = {
                     "route applies to every child in this call, including batches."
                 ),
             },
+            "fork_turns": {
+                "type": "string",
+                "description": (
+                    "Parent history to inherit: 'none', 'all', or a positive "
+                    "integer string for the most recent completed semantic turns. "
+                    "Overrides the selected route's default_fork. Omitted or empty "
+                    "uses the route default, then the compatibility default 'none'."
+                ),
+            },
             "tasks": {
                 "type": "array",
                 "items": {
@@ -3962,6 +4194,13 @@ DELEGATE_TASK_SCHEMA = {
                             "type": "string",
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
+                        },
+                        "fork_turns": {
+                            "type": "string",
+                            "description": (
+                                "Per-task history override: 'none', 'all', or a "
+                                "positive integer string. Beats call-level fork_turns."
+                            ),
                         },
                     },
                     "required": ["goal"],
@@ -4046,6 +4285,7 @@ registry.register(
         context=args.get("context"),
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         route=args.get("route"),
+        fork_turns=args.get("fork_turns"),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")),

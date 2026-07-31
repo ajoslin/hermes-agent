@@ -9,6 +9,7 @@ Run with:  python -m pytest tests/test_delegate.py -v
    or:     python tests/test_delegate.py
 """
 
+import copy
 import json
 import os
 import tempfile
@@ -31,6 +32,12 @@ from tools.delegate_tool import (
     _build_child_agent,
     _build_child_progress_callback,
     _build_child_system_prompt,
+    _build_child_task_message,
+    _parent_fork_snapshot,
+    _project_fork_history,
+    _parse_fork_turns,
+    _resolve_fork_turns,
+    _resolve_delegation_route,
     _extract_output_tail,
     _strip_blocked_tools,
     _resolve_child_credential_pool,
@@ -148,21 +155,497 @@ class TestDelegateRequirements(unittest.TestCase):
 
 
 class TestChildSystemPrompt(unittest.TestCase):
+    def test_public_all_fork_projects_history_into_one_child_packet(self):
+        parent = _make_mock_parent(depth=1)
+        parent._active_delegate_user_message = "Please investigate the regression"
+        parent._session_messages = [
+            {"role": "system", "content": "parent-only system"},
+            {"role": "user", "content": "Earlier question", "api_content": "Earlier question\n\nCACHED"},
+            {"role": "assistant", "reasoning": "secret", "tool_calls": [{"id": "t1"}], "content": "working"},
+            {"role": "tool", "tool_call_id": "t1", "content": "private output"},
+            {"role": "assistant", "content": "Earlier final answer", "internal": "drop me"},
+            {"role": "user", "content": "Please investigate the regression"},
+        ]
+        before = json.loads(json.dumps(parent._session_messages))
+        captured = {}
+
+        with (
+            patch("run_agent.AIAgent") as MockAgent,
+            patch("tools.delegate_tool._get_max_spawn_depth", return_value=2),
+        ):
+            child = MagicMock()
+            child.run_conversation.side_effect = lambda **kwargs: (
+                captured.update(kwargs)
+                or {"final_response": "done", "completed": True, "api_calls": 1}
+            )
+            MockAgent.return_value = child
+            result = json.loads(
+                delegate_task(
+                    goal="Find and fix it",
+                    context="Stay inside the owned files",
+                    fork_turns="all",
+                    parent_agent=parent,
+                )
+            )
+
+        self.assertEqual(result["results"][0]["status"], "completed")
+        self.assertEqual(
+            captured["conversation_history"],
+            [
+                {"role": "user", "content": "Earlier question", "api_content": "Earlier question\n\nCACHED"},
+                {"role": "assistant", "content": "Earlier final answer"},
+            ],
+        )
+        packet = captured["user_message"]
+        self.assertEqual(packet.count("Please investigate the regression"), 1)
+        self.assertEqual(packet.count("Find and fix it"), 1)
+        self.assertEqual(packet.count("Stay inside the owned files"), 1)
+        self.assertEqual(parent._session_messages, before)
+
     def test_goal_only(self):
         prompt = _build_child_system_prompt("Fix the tests")
-        self.assertIn("Fix the tests", prompt)
-        self.assertIn("YOUR TASK", prompt)
+        self.assertNotIn("Fix the tests", prompt)
+        self.assertNotIn("YOUR TASK", prompt)
         self.assertNotIn("CONTEXT", prompt)
 
     def test_goal_with_context(self):
         prompt = _build_child_system_prompt("Fix the tests", "Error: assertion failed in test_foo.py line 42")
-        self.assertIn("Fix the tests", prompt)
-        self.assertIn("CONTEXT", prompt)
-        self.assertIn("assertion failed", prompt)
+        self.assertNotIn("Fix the tests", prompt)
+        self.assertNotIn("assertion failed", prompt)
+        packet = _build_child_task_message("Fix the tests", "Error: assertion failed in test_foo.py line 42")
+        self.assertIn("Fix the tests", packet)
+        self.assertIn("EXPLICIT CONTEXT", packet)
+        self.assertIn("assertion failed", packet)
+
+    def test_system_prompt_is_stable_across_task_payloads(self):
+        first = _build_child_system_prompt("First goal", "First context")
+        second = _build_child_system_prompt("Different goal", "Different context")
+        self.assertEqual(first, second)
 
     def test_empty_context_ignored(self):
         prompt = _build_child_system_prompt("Do something", "  ")
         self.assertNotIn("CONTEXT", prompt)
+
+
+class TestForkTurnsContract(unittest.TestCase):
+    def test_schema_exposes_call_and_task_selectors(self):
+        props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
+        self.assertEqual(props["fork_turns"]["type"], "string")
+        self.assertEqual(
+            props["tasks"]["items"]["properties"]["fork_turns"]["type"],
+            "string",
+        )
+
+    def test_selector_parser_accepts_only_frozen_string_grammar(self):
+        for raw, expected in (
+            (" none ", "none"),
+            ("ALL", "all"),
+            (" 03 ", "3"),
+            ("", None),
+            (None, None),
+        ):
+            self.assertEqual(_parse_fork_turns(raw, "fork_turns"), expected)
+        for raw in (0, 1, True, "0", "-1", "1.5", "everything"):
+            with self.assertRaisesRegex(ValueError, "fork_turns"):
+                _parse_fork_turns(raw, "fork_turns")
+
+    def test_precedence_is_task_then_call_then_route_then_fresh(self):
+        self.assertEqual(_resolve_fork_turns("1", "2", "all", task_index=0), "1")
+        self.assertEqual(_resolve_fork_turns(" ", "2", "all", task_index=0), "2")
+        self.assertEqual(_resolve_fork_turns(None, "", "ALL", task_index=0), "all")
+        self.assertEqual(_resolve_fork_turns(None, None, None, task_index=0), "none")
+
+    def test_numeric_counts_completed_semantic_turns_not_messages(self):
+        history = [
+            {"role": "user", "content": "u1"},
+            {"role": "assistant", "tool_calls": [{"id": "t"}], "content": "work"},
+            {"role": "tool", "content": "private"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "hidden", "display_kind": "hidden"},
+            {"role": "assistant", "content": "hidden answer", "display_kind": "hidden"},
+            {"role": "user", "content": "u2"},
+            {"role": "assistant", "content": "a2"},
+            {"role": "user", "content": "active incomplete"},
+        ]
+        self.assertEqual(
+            _project_fork_history(history, "1"),
+            [{"role": "user", "content": "u2"}, {"role": "assistant", "content": "a2"}],
+        )
+
+    def test_projection_preserves_visible_multimodal_and_api_bytes_only(self):
+        multimodal = [
+            {"type": "text", "text": "inspect this"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+        ]
+        history = [
+            {"role": "system", "content": "parent system"},
+            {
+                "role": "user",
+                "content": multimodal,
+                "timestamp": 123,
+                "display_metadata": {"private": True},
+            },
+            {
+                "role": "assistant",
+                "content": "visible answer",
+                "api_content": "visible answer\n\nCACHED-BYTES",
+                "reasoning": "secret chain",
+                "reasoning_details": [{"secret": True}],
+                "internal": "drop",
+            },
+            {
+                "role": "user",
+                "content": "delegation lifecycle",
+                "display_kind": "async_delegation_complete",
+            },
+            {"role": "assistant", "content": "must not be stitched"},
+            {"role": "user", "content": "incomplete tool turn"},
+            {"role": "assistant", "content": "calling", "tool_calls": [{"id": "x"}]},
+            {"role": "tool", "content": "private tool output", "tool_call_id": "x"},
+        ]
+        before = copy.deepcopy(history)
+
+        projected = _project_fork_history(history, "all")
+
+        self.assertEqual(
+            projected,
+            [
+                {"role": "user", "content": multimodal},
+                {
+                    "role": "assistant",
+                    "content": "visible answer",
+                    "api_content": "visible answer\n\nCACHED-BYTES",
+                },
+            ],
+        )
+        self.assertEqual(history, before)
+        self.assertIsNot(projected[0]["content"], history[1]["content"])
+
+    def test_multimodal_active_request_is_copied_and_included_once(self):
+        active = [
+            {"type": "text", "text": "active request"},
+            {"type": "image_url", "image_url": {"url": "https://example.invalid/a.png"}},
+        ]
+        before = copy.deepcopy(active)
+        packet = _build_child_task_message("inspect", "be precise", active)
+        self.assertEqual(active, before)
+        self.assertEqual(packet[:-1], active)
+        self.assertEqual(
+            sum(
+                part.get("text", "").count("active request")
+                for part in packet
+                if isinstance(part, dict)
+            ),
+            1,
+        )
+        self.assertIn("DELEGATED GOAL:\ninspect", packet[-1]["text"])
+
+    def test_numeric_does_not_count_compaction_summary(self):
+        history = [
+            {"role": "user", "content": "summary", "_compressed_summary": True},
+            {"role": "assistant", "content": "summary continuation"},
+            {"role": "user", "content": "provable"},
+            {"role": "assistant", "content": "answer"},
+        ]
+        projected = _project_fork_history(history, "2")
+        self.assertEqual([m["content"] for m in projected], ["provable", "answer"])
+        self.assertIn("summary", [m["content"] for m in _project_fork_history(history, "all")])
+
+    def test_all_keeps_assistant_role_compaction_baseline_numeric_does_not(self):
+        history = [
+            {"role": "assistant", "content": "effective summary", "_compressed_summary": True},
+            {"role": "user", "content": "provable"},
+            {"role": "assistant", "content": "answer"},
+        ]
+        self.assertEqual(
+            [m["content"] for m in _project_fork_history(history, "all")],
+            ["effective summary", "provable", "answer"],
+        )
+        self.assertEqual(
+            [m["content"] for m in _project_fork_history(history, "2")],
+            ["provable", "answer"],
+        )
+
+    def test_content_only_compaction_summary_is_baseline_not_numeric_turn(self):
+        from agent.context_compressor import SUMMARY_PREFIX
+
+        summary = f"{SUMMARY_PREFIX}\nDurable compacted context"
+        history = [
+            {"role": "assistant", "content": summary},
+            {"role": "user", "content": "provable"},
+            {"role": "assistant", "content": "answer", "finish_reason": "stop"},
+        ]
+
+        self.assertEqual(
+            [m["content"] for m in _project_fork_history(history, "all")],
+            [summary, "provable", "answer"],
+        )
+        self.assertEqual(
+            [m["content"] for m in _project_fork_history(history, "2")],
+            ["provable", "answer"],
+        )
+
+    def test_all_never_moves_summary_ahead_of_earlier_protected_turns(self):
+        history = [
+            {"role": "user", "content": "protected user"},
+            {"role": "assistant", "content": "protected answer"},
+            {"role": "assistant", "content": "summary", "_compressed_summary": True},
+            {"role": "user", "content": "later user"},
+            {"role": "assistant", "content": "later answer"},
+        ]
+
+        projected = _project_fork_history(history, "all")
+
+        self.assertEqual(
+            [m["content"] for m in projected],
+            ["protected user", "summary", "later user", "later answer"],
+        )
+        self.assertTrue(all(
+            left["role"] != right["role"]
+            for left, right in zip(projected, projected[1:])
+        ))
+
+    def test_internal_scaffolding_and_incomplete_assistants_are_not_eligible(self):
+        flags = (
+            "_empty_recovery_synthetic",
+            "_empty_terminal_sentinel",
+            "_thinking_prefill",
+            "_verification_stop_synthetic",
+            "_pre_verify_synthetic",
+            "_kanban_stop_synthetic",
+            "_dropped_toolcall_nudge",
+        )
+        history = []
+        for index, flag in enumerate(flags):
+            history.extend([
+                {"role": "user", "content": f"internal {index}", flag: True},
+                {"role": "assistant", "content": f"internal answer {index}"},
+            ])
+        history.extend([
+            {"role": "user", "content": "auto continue", "display_kind": "auto_continue"},
+            {"role": "assistant", "content": "completed", "finish_reason": "stop"},
+            {"role": "user", "content": "truncated"},
+            {"role": "assistant", "content": "partial", "finish_reason": "length"},
+            {"role": "user", "content": "needs verify"},
+            {"role": "assistant", "content": "candidate", "finish_reason": "verification_required"},
+            {"role": "user", "content": "legacy durable"},
+            {"role": "assistant", "content": "legacy answer"},
+        ])
+
+        self.assertEqual(
+            [m["content"] for m in _project_fork_history(history, "all")],
+            ["auto continue", "completed", "legacy durable", "legacy answer"],
+        )
+
+    def test_internal_continuations_preserve_surrounding_completed_turn(self):
+        history = [
+            {"role": "user", "content": "verify request"},
+            {
+                "role": "assistant",
+                "content": "candidate report",
+                "finish_reason": "verification_required",
+            },
+            {
+                "role": "user",
+                "content": "internal verification nudge",
+                "_verification_stop_synthetic": True,
+            },
+            {"role": "assistant", "content": "verified report", "finish_reason": "stop"},
+            {"role": "user", "content": "review request"},
+            {
+                "role": "assistant",
+                "content": "Let me call the tool.",
+                "_dropped_toolcall_nudge": True,
+            },
+            {
+                "role": "user",
+                "content": "issue the tool call now",
+                "_dropped_toolcall_nudge": True,
+            },
+            {"role": "assistant", "content": "review complete", "finish_reason": "stop"},
+        ]
+
+        self.assertEqual(
+            [m["content"] for m in _project_fork_history(history, "all")],
+            ["verify request", "verified report", "review request", "review complete"],
+        )
+
+    def test_redirect_checkpoint_is_not_completed_and_correction_is_active(self):
+        from agent.conversation_loop import _apply_active_turn_redirect
+
+        parent = MagicMock()
+        parent._active_delegate_user_message = "original request"
+        parent._current_streamed_assistant_text = "partial visible reply"
+        parent._strip_think_blocks.side_effect = lambda value: value
+        parent._stream_needs_break = False
+        messages = [{"role": "user", "content": "original request"}]
+
+        _apply_active_turn_redirect(parent, messages, "use the corrected target")
+
+        self.assertEqual(
+            parent._active_delegate_user_message,
+            "original request\n\nUser correction during the turn: use the corrected target",
+        )
+        self.assertTrue(messages[-2]["_interrupted_redirect_checkpoint"])
+        parent._session_messages = messages
+        snapshot, active = _parent_fork_snapshot(parent)
+        self.assertEqual(snapshot, messages)
+        self.assertIn("use the corrected target", active)
+        self.assertEqual(_project_fork_history(snapshot, "all"), [])
+
+        reloaded = copy.deepcopy(messages)
+        reloaded[-2].pop("_interrupted_redirect_checkpoint")
+        reloaded.append(
+            {"role": "assistant", "content": "corrected final", "finish_reason": "stop"}
+        )
+        self.assertEqual(
+            [m["content"] for m in _project_fork_history(reloaded, "all")],
+            ["use the corrected target", "corrected final"],
+        )
+
+        multimodal = [
+            {"type": "text", "text": "inspect this image"},
+            {"type": "image_url", "image_url": {"url": "https://example.invalid/a.png"}},
+        ]
+        multimodal_before = copy.deepcopy(multimodal)
+        parent._active_delegate_user_message = multimodal
+        parent._current_streamed_assistant_text = ""
+        _apply_active_turn_redirect(parent, [], "use the second chart")
+        self.assertEqual(multimodal, multimodal_before)
+        self.assertEqual(
+            parent._active_delegate_user_message[:-1], multimodal_before
+        )
+        self.assertEqual(
+            parent._active_delegate_user_message[-1],
+            {
+                "type": "text",
+                "text": "User correction during the turn: use the second chart",
+            },
+        )
+
+    def test_only_stop_is_an_explicit_terminal_assistant_finish_reason(self):
+        rejected = (
+            "length", "incomplete", "tool_calls", "verification_required",
+            "verify_hook_continue", "kanban_terminal_required", "in_progress",
+        )
+        history = []
+        for reason in rejected:
+            history.extend([
+                {"role": "user", "content": f"u-{reason}"},
+                {"role": "assistant", "content": f"a-{reason}", "finish_reason": reason},
+            ])
+        history.extend([
+            {"role": "user", "content": "u-stop"},
+            {"role": "assistant", "content": "a-stop", "finish_reason": "stop"},
+        ])
+
+        self.assertEqual(
+            [m["content"] for m in _project_fork_history(history, "all")],
+            ["u-stop", "a-stop"],
+        )
+
+    def test_route_default_validation_uses_selector_grammar(self):
+        effective = _resolve_delegation_route(
+            {"routes": {"worker": {"default_fork": " ALL "}}}, "worker"
+        )
+        self.assertEqual(effective["default_fork"], "all")
+        with self.assertRaisesRegex(ValueError, "default_fork"):
+            _resolve_delegation_route(
+                {"routes": {"worker": {"default_fork": 2}}}, "worker"
+            )
+
+    def test_invalid_task_selector_names_the_task(self):
+        parent = _make_mock_parent()
+        result = json.loads(
+            delegate_task(
+                tasks=[{"goal": "ok"}, {"goal": "bad", "fork_turns": "0"}],
+                parent_agent=parent,
+            )
+        )
+        self.assertIn("Task 1 fork_turns", result["error"])
+
+    def test_invalid_batch_selector_is_atomic(self):
+        parent = _make_mock_parent()
+        with patch("run_agent.AIAgent") as MockAgent:
+            result = json.loads(
+                delegate_task(
+                    tasks=[
+                        {"goal": "first", "fork_turns": "all"},
+                        {"goal": "bad", "fork_turns": "0"},
+                    ],
+                    parent_agent=parent,
+                )
+            )
+        self.assertIn("Task 1 fork_turns", result["error"])
+        MockAgent.assert_not_called()
+
+    def test_fresh_default_and_route_call_task_precedence_reach_children(self):
+        parent = _make_mock_parent()
+        parent._session_messages = [
+            {"role": "user", "content": "u1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "u2"},
+            {"role": "assistant", "content": "a2"},
+        ]
+
+        def run_with(config, **kwargs):
+            built = []
+
+            def make_child(**_child_kwargs):
+                child = MagicMock()
+                child.run_conversation.return_value = {
+                    "final_response": "done",
+                    "completed": True,
+                    "api_calls": 1,
+                    "messages": [],
+                }
+                built.append(child)
+                return child
+
+            with (
+                patch("tools.delegate_tool._load_config", return_value=config),
+                patch("run_agent.AIAgent", side_effect=make_child),
+            ):
+                result = json.loads(delegate_task(parent_agent=parent, **kwargs))
+            self.assertNotIn("error", result)
+            return [child._delegate_conversation_history for child in built]
+
+        self.assertEqual(run_with({}, goal="fresh"), [[]])
+        self.assertEqual(
+            run_with({"default_fork": "all"}, goal="no-global-default"),
+            [[]],
+        )
+        self.assertEqual(
+            run_with(
+                {"routes": {"worker": {"default_fork": "1"}}},
+                goal="route",
+                route="worker",
+            ),
+            [[
+                {"role": "user", "content": "u2"},
+                {"role": "assistant", "content": "a2"},
+            ]],
+        )
+        self.assertEqual(
+            run_with(
+                {"routes": {"worker": {"default_fork": "1"}}},
+                tasks=[
+                    {"goal": "task-none", "fork_turns": "none"},
+                    {"goal": "call-all"},
+                ],
+                route="worker",
+                fork_turns="all",
+            ),
+            [
+                [],
+                [
+                    {"role": "user", "content": "u1"},
+                    {"role": "assistant", "content": "a1"},
+                    {"role": "user", "content": "u2"},
+                    {"role": "assistant", "content": "a2"},
+                ],
+            ],
+        )
 
 
 class TestStripBlockedTools(unittest.TestCase):
@@ -789,7 +1272,12 @@ class TestToolNamePreservation(unittest.TestCase):
         with patch("run_agent.AIAgent") as MockAgent:
             mock_child = MagicMock()
 
-            def capture_and_return(user_message, task_id=None, stream_callback=None):
+            def capture_and_return(
+                user_message,
+                conversation_history=None,
+                task_id=None,
+                stream_callback=None,
+            ):
                 captured["saved"] = list(mock_child._delegate_saved_tool_names)
                 return {"final_response": "ok", "completed": True, "api_calls": 1}
 
@@ -2683,6 +3171,7 @@ class TestDispatchDelegateTask(unittest.TestCase):
                 {
                     "goal": "test",
                     "route": "review",
+                    "fork_turns": "all",
                     "acp_command": "claude",
                     "acp_args": ["--acp", "--stdio"],
                     "tasks": [
@@ -2699,10 +3188,11 @@ class TestDispatchDelegateTask(unittest.TestCase):
         self.assertNotIn("acp_args", captured)
         self.assertEqual(captured["goal"], "test")
         self.assertEqual(captured["route"], "review")
+        self.assertEqual(captured["fork_turns"], "all")
         self.assertNotIn("acp_command", captured["tasks"][0])
         self.assertNotIn("acp_args", captured["tasks"][0])
 
-    def test_registry_fallback_forwards_call_level_route(self):
+    def test_registry_fallback_forwards_call_level_route_and_fork(self):
         from tools.registry import registry
 
         captured = {}
@@ -2714,11 +3204,12 @@ class TestDispatchDelegateTask(unittest.TestCase):
         parent = _make_mock_parent(depth=0)
         with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
             registry._tools["delegate_task"].handler(
-                {"goal": "test", "route": "review"},
+                {"goal": "test", "route": "review", "fork_turns": "3"},
                 parent_agent=parent,
             )
 
         self.assertEqual(captured["route"], "review")
+        self.assertEqual(captured["fork_turns"], "3")
 
 class TestDelegateEventEnum(unittest.TestCase):
     """Tests for DelegateEvent enum and back-compat aliases."""
@@ -3372,7 +3863,12 @@ class TestOrchestratorEndToEnd(unittest.TestCase):
                 m.thinking_callback = None
                 orch_mock["agent"] = m
 
-                def _orchestrator_run(user_message=None, task_id=None, stream_callback=None):
+                def _orchestrator_run(
+                    user_message=None,
+                    conversation_history=None,
+                    task_id=None,
+                    stream_callback=None,
+                ):
                     # Re-entrant: orchestrator spawns two leaves
                     delegate_task(
                         tasks=[{"goal": "leaf-A"}, {"goal": "leaf-B"}],

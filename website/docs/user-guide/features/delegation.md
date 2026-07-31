@@ -6,7 +6,7 @@ description: "Spawn isolated child agents for parallel workstreams with delegate
 
 # Subagent Delegation
 
-The `delegate_task` tool spawns child AIAgent instances with isolated context, inherited tool access, and their own terminal sessions. Each child gets a fresh conversation and works independently — only its final summary enters the parent's context.
+The `delegate_task` tool spawns child AIAgent instances with isolated execution, inherited tool access, and their own terminal sessions. Children start with a fresh conversation by default, or can receive a sanitized snapshot of completed parent turns through `fork_turns`. Only each child's final summary enters the parent's context.
 
 Top-level model calls run in the background automatically. Hermes returns a handle immediately so the conversation can continue, then posts the result back as a new message. An orchestrator subagent waits for its own workers so it can synthesize their results before returning.
 
@@ -33,11 +33,11 @@ delegate_task(tasks=[
 
 ## How Subagent Context Works
 
-:::warning Critical: Subagents Know Nothing
-Subagents start with a **completely fresh conversation**. They have zero knowledge of the parent's conversation history, prior tool calls, or anything discussed before delegation. The subagent's only context comes from the `goal` and `context` fields the parent agent populates when it calls `delegate_task`.
+:::info Compatibility default: fresh children
+When `fork_turns` is omitted and the selected route has no `default_fork`, the child inherits no parent history. This preserves the existing fresh-child behavior. Pass the task's `goal` and any explicit `context` it needs, or choose a fork deliberately.
 :::
 
-This means the parent agent must pass **everything** the subagent needs in the call:
+For a fresh child, the parent must pass **everything** the subagent needs in the call:
 
 ```python
 # BAD - subagent has no idea what "the error" is
@@ -54,7 +54,38 @@ delegate_task(
 )
 ```
 
-The subagent receives a focused system prompt built from your goal and context, instructing it to complete the task and provide a structured summary of what it did, what it found, any files modified, and any issues encountered.
+Every child uses the same stable system instructions for its role and tools. The active user request, delegated `goal`, and explicit `context` are placed in one final user task message after any inherited history.
+
+### Forking parent turns
+
+`fork_turns` accepts string values only:
+
+- `"none"` — inherit no parent history.
+- `"all"` — inherit all eligible history from the parent's current effective context.
+- A positive integer string such as `"3"` — inherit the most recent three completed semantic turns.
+
+Whitespace is trimmed, and `none`/`all` are case-insensitive. Empty or omitted values continue through default resolution. Zero, negative numbers, booleans, non-string values, and other text are rejected.
+
+```python
+# Inherit all eligible effective context.
+delegate_task(
+    goal="Continue the investigation and implement the fix",
+    fork_turns="all",
+)
+
+# Give every child the latest two completed turns, but keep one child fresh.
+delegate_task(
+    tasks=[
+        {"goal": "Implement the chosen approach"},
+        {"goal": "Review without prior conclusions", "fork_turns": "none"},
+    ],
+    fork_turns="2",
+)
+```
+
+A numeric selector counts completed user/assistant semantic turns, not raw messages. Forks exclude system and developer prompts, hidden reasoning, tool calls and results, approvals, display-hidden scaffolding, delegation lifecycle records, and internal metadata. Visible multimodal user content and retained model-visible `api_content` are copied exactly. The in-progress assistant tool chain is never inherited; the active visible request appears once in the final child task message.
+
+Forks are dispatch-time copies. Later parent or sibling messages do not enter the child, and the parent transcript is not mutated. If inherited history plus the final task exceeds the child's limit, the child uses the existing preflight compression path; Hermes does not silently downgrade `"all"` to a smaller fork.
 
 ## Practical Examples
 
@@ -155,7 +186,7 @@ delegation:
 If these values are omitted, subagents inherit them from the parent.
 
 For call-level selection, define user-named routes under `delegation.routes`.
-Each route may set only `model`, `provider`, and `reasoning_effort`:
+Each route may set `model`, `provider`, `reasoning_effort`, and `default_fork`:
 
 ```yaml
 # In ~/.hermes/config.yaml
@@ -168,9 +199,11 @@ delegation:
     quick:
       model: "google/gemini-flash-2.0"
       reasoning_effort: low
+      default_fork: none
     deep-review:
       model: "anthropic/claude-opus-4"
       reasoning_effort: high
+      default_fork: all
 ```
 
 Select a route with the single optional, call-level `route` parameter:
@@ -197,10 +230,24 @@ delegate_task(
 
 A route overrides the top-level delegation values it defines. Missing route
 fields inherit the top-level `delegation.model`, `delegation.provider`, and
-`delegation.reasoning_effort`, then the existing parent behavior. When `route`
-is omitted, Hermes uses `delegation.default_route` if configured. With neither
-a call route nor a default route, delegation behaves as before. Unknown or
-invalid selected routes fail before any child starts.
+`delegation.reasoning_effort`, then the existing parent behavior. Fork selection
+uses this precedence:
+
+1. Per-task `fork_turns`.
+2. Call-level `fork_turns`.
+3. The selected route's `default_fork`.
+4. The compatibility default `"none"`.
+
+There is no top-level `delegation.default_fork`. A route's `default_fork` uses
+the same `none` / `all` / positive-integer-string grammar as `fork_turns`.
+Route defaults are only examples until you add them to your own configuration;
+Hermes does not activate forked worker or reviewer routes automatically.
+
+When `route` is omitted, Hermes uses `delegation.default_route` if configured.
+With neither a call route nor a default route, delegation behaves as before.
+Unknown or invalid selected routes fail before any child starts. The selected
+route still applies to the whole batch; per-task fork overrides do not change
+its model, provider, reasoning effort, role, tools, or credentials.
 
 ## Inherited Tool Access
 
@@ -386,7 +433,7 @@ For **durable execution** that must survive session closure or process restart, 
 | Factor | delegate_task | execute_code |
 |--------|--------------|-------------|
 | **Reasoning** | Full LLM reasoning loop | Just Python code execution |
-| **Context** | Fresh isolated conversation | No conversation, just script |
+| **Context** | Fresh by default; optional sanitized `fork_turns` snapshot | No conversation, just script |
 | **Tool access** | All non-blocked tools with reasoning | 7 tools via RPC, no reasoning |
 | **Parallelism** | 3 concurrent subagents by default (configurable) | Single script |
 | **Best for** | Complex tasks needing judgment | Mechanical multi-step pipelines |

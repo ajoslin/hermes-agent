@@ -6,7 +6,7 @@ description: "When and how to use subagent delegation — patterns for parallel 
 
 # Delegation & Parallel Work
 
-Hermes can spawn isolated child agents to work on tasks in parallel. Each subagent gets its own conversation, terminal session, and toolset. Only the final summary comes back — intermediate tool calls never enter your context window.
+Hermes can spawn isolated child agents to work on tasks in parallel. Each subagent gets its own conversation, terminal session, and toolset. A child starts fresh by default, or it can inherit sanitized completed parent turns through `fork_turns`. Only the final summary comes back — intermediate tool calls never enter your context window.
 
 For the full feature reference, see [Subagent Delegation](/user-guide/features/delegation).
 
@@ -84,12 +84,13 @@ delegate_task(
     Auth files: src/auth/login.py, src/auth/jwt.py, src/auth/middleware.py
     Test command: pytest tests/auth/ -v
     Focus on: SQL injection, JWT validation, password hashing, session management.
-    Fix issues found and verify tests pass."""
+    Fix issues found and verify tests pass.""",
+    fork_turns="none",
 )
 ```
 
 :::warning The Context Problem
-Subagents know **absolutely nothing** about your conversation. They start completely fresh. If you delegate "fix the bug we were discussing," the subagent has no idea what bug you mean. Always pass file paths, error messages, project structure, and constraints explicitly.
+Subagents start fresh unless `fork_turns` or a selected route's `default_fork` requests inherited turns. A fresh child has no idea what "the bug we were discussing" means, so pass file paths, error messages, project structure, and constraints explicitly. A fork copies only eligible completed history; explicit task constraints still belong in `goal` and `context`.
 :::
 
 ---
@@ -219,7 +220,7 @@ delegation:
 ```
 
 - **Separate terminals** — each subagent gets its own terminal session with separate working directory and state
-- **No conversation history** — subagents see only the `goal` and `context` the parent agent passes when calling `delegate_task`
+- **Fresh by default** — without `fork_turns` or a route `default_fork`, subagents see only the active request, `goal`, and `context`; explicit or route-selected forks can inherit sanitized parent turns
 - **Default 50 iterations** — set `max_iterations` lower for simple tasks to save cost
 - **Not durable** — top-level delegation runs in the background and posts its result back later, but it remains tied to the owning session and Hermes process. Session closure, `/stop`, `/new`, or a process restart can cancel or strand in-progress work. Use `cronjob` or `terminal(background=True, notify_on_complete=True)` for work that must survive those boundaries.
 

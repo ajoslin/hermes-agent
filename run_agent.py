@@ -215,45 +215,10 @@ from agent.tool_dispatch_helpers import (
     _trajectory_normalize_msg,  # noqa: F401  # re-exported for tests that `from run_agent import _trajectory_normalize_msg`
 )
 from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_float, is_truthy_value, model_forces_max_completion_tokens
-
-
-# Internal flags that mark a message as ephemeral empty-response/prefill
-# recovery scaffolding: the synthetic assistant "(empty)" turn and user nudge
-# injected after an empty response, the terminal "(empty)" sentinel, and the
-# thinking-only prefill placeholder. These exist only to drive the next API
-# retry; the in-memory loop pops them before appending the real response.
-# Persistence must mirror that, otherwise an append-only flush can commit them
-# to the session store and a resumed session replays synthetic "(empty)"/nudge
-# turns as if they were genuine context.
-_EPHEMERAL_SCAFFOLDING_FLAGS = (
-    "_empty_recovery_synthetic",
-    "_empty_terminal_sentinel",
-    "_thinking_prefill",
-    # verify-on-stop and pre_verify nudges append a synthetic user nudge to
-    # keep the agent going one more turn before it can claim completion.
-    # The nudge exists only to drive the verification loop; persisting it
-    # poisons the resumed transcript and breaks prompt-prefix cache reuse
-    # on later turns. The assistant candidate is NOT synthetic — it is
-    # persisted and emitted as an interim message (#65919).
-    "_verification_stop_synthetic",
-    "_pre_verify_synthetic",
-    # kanban worker stop-guard: narrated exit without kanban_complete/block
-    "_kanban_stop_synthetic",
-    # dropped tool-call re-prompt pair (finish_reason=tool_calls with an
-    # empty tool_calls array): the interim narration-only assistant turn
-    # and the "issue the actual tool call now" user nudge exist only to
-    # drive the bounded retry. Persisting them would replay the internal
-    # retry instruction as user-authored context on resume.
-    "_dropped_toolcall_nudge",
+from agent.message_eligibility import (
+    EPHEMERAL_SCAFFOLDING_FLAGS as _EPHEMERAL_SCAFFOLDING_FLAGS,
+    is_ephemeral_scaffolding as _is_ephemeral_scaffolding,
 )
-
-
-def _is_ephemeral_scaffolding(msg: Any) -> bool:
-    """Return True when ``msg`` is internal recovery scaffolding that must never
-    be persisted to the durable transcript (SQLite session store or JSON log)."""
-    return isinstance(msg, dict) and any(
-        msg.get(flag) for flag in _EPHEMERAL_SCAFFOLDING_FLAGS
-    )
 
 
 _MAX_TOOL_WORKERS = 8
@@ -6923,6 +6888,7 @@ class AIAgent:
             context=function_args.get("context"),
             tasks=_strip_model_hidden_task_fields(function_args.get("tasks")),
             route=function_args.get("route"),
+            fork_turns=function_args.get("fork_turns"),
             max_iterations=function_args.get("max_iterations"),
             role=function_args.get("role"),
             background=(not _is_subagent),
@@ -7109,20 +7075,41 @@ class AIAgent:
             # replaces the value with the live runtime after fallback restoration.
             # Keep the scope local instead of storing ContextVar tokens on the agent,
             # which may be observed from another thread.
-            with bind_subagent_parent(self), scoped_runtime_main({}):
-                result = run_conversation(
-                    self,
-                    user_message,
-                    system_message,
-                    conversation_history,
-                    effective_task_id,
-                    stream_callback,
-                    persist_user_message,
-                    persist_user_timestamp=persist_user_timestamp,
-                    persist_user_display_kind=persist_user_display_kind,
-                    persist_user_display_metadata=persist_user_display_metadata,
-                    moa_config=moa_config,
-                )
+            # Expose only the active visible request to delegate_task while this
+            # turn runs. The child packet folds it into its final user message;
+            # inherited history still comes from the effective _session_messages.
+            _missing_active_request = object()
+            _previous_active_request = getattr(
+                self, "_active_delegate_user_message", _missing_active_request
+            )
+            self._active_delegate_user_message = (
+                persist_user_message
+                if persist_user_message is not None
+                else user_message
+            )
+            try:
+                with bind_subagent_parent(self), scoped_runtime_main({}):
+                    result = run_conversation(
+                        self,
+                        user_message,
+                        system_message,
+                        conversation_history,
+                        effective_task_id,
+                        stream_callback,
+                        persist_user_message,
+                        persist_user_timestamp=persist_user_timestamp,
+                        persist_user_display_kind=persist_user_display_kind,
+                        persist_user_display_metadata=persist_user_display_metadata,
+                        moa_config=moa_config,
+                    )
+            finally:
+                if _previous_active_request is _missing_active_request:
+                    try:
+                        del self._active_delegate_user_message
+                    except AttributeError:
+                        pass
+                else:
+                    self._active_delegate_user_message = _previous_active_request
             terminal = result if isinstance(result, dict) else {}
             if terminal.get("interrupted") is True:
                 relay_outcome = "cancelled"

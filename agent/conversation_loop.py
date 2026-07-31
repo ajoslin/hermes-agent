@@ -16,6 +16,7 @@ resolved through :func:`_ra` so those patches keep working.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -185,6 +186,7 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
             "role": "assistant",
             "content": visible or checkpoint,
             "api_content": checkpoint,
+            "_interrupted_redirect_checkpoint": True,
         }
         if not visible:
             # Nothing reached the screen — this row carries no assistant prose
@@ -192,6 +194,20 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
             entry["display_kind"] = "hidden"
         messages.append(entry)
         messages.append({"role": "user", "content": text})
+
+    if hasattr(agent, "_active_delegate_user_message"):
+        active_request = getattr(agent, "_active_delegate_user_message", None)
+        correction = f"User correction during the turn: {text}"
+        if isinstance(active_request, str):
+            agent._active_delegate_user_message = (
+                f"{active_request}\n\n{correction}"
+            )
+        elif isinstance(active_request, list):
+            corrected_request = copy.deepcopy(active_request)
+            corrected_request.append({"type": "text", "text": correction})
+            agent._active_delegate_user_message = corrected_request
+        else:
+            agent._active_delegate_user_message = text
 
     agent._current_streamed_assistant_text = ""
     agent._stream_needs_break = True
@@ -1262,7 +1278,11 @@ def run_conversation(
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:
             _apply_active_turn_redirect(agent, messages, _redirect_text)
-            if isinstance(original_user_message, str):
+            if hasattr(agent, "_active_delegate_user_message"):
+                original_user_message = copy.deepcopy(
+                    agent._active_delegate_user_message
+                )
+            elif isinstance(original_user_message, str):
                 original_user_message = (
                     f"{original_user_message}\n\n"
                     f"User correction during the turn: {_redirect_text}"
