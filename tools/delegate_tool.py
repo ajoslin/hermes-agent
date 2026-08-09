@@ -2529,6 +2529,63 @@ def _run_single_child(
                         _retry_text, _output_schema
                     )
 
+        # Scout named-output contract validation + one bounded correction.
+        # Exact headings make coverage deterministic and prevent a generic
+        # prior summary from being accepted merely because it is non-empty.
+        _required_outputs = getattr(child, "_delegate_required_outputs", None)
+        _required_outputs_valid: Optional[bool] = None
+        _required_outputs_errors: List[str] = []
+        _required_outputs_retries = 0
+        if isinstance(_required_outputs, list) and _required_outputs:
+            from tools.delegation_required_outputs import (
+                build_required_outputs_retry_message,
+                validate_required_outputs,
+            )
+
+            _first_text = result.get("final_response") or ""
+            _required_outputs_valid, _required_outputs_errors = (
+                validate_required_outputs(_first_text, _required_outputs)
+            )
+            if (
+                not _required_outputs_valid
+                and _first_text.strip()
+                and not result.get("interrupted", False)
+            ):
+                _required_outputs_retries = 1
+                _retry_result = None
+                try:
+                    _retry_result = child.run_conversation(
+                        user_message=build_required_outputs_retry_message(
+                            _required_outputs_errors
+                        ),
+                        task_id=child_task_id,
+                        stream_callback=_relay_child_text,
+                    )
+                except Exception as _retry_exc:
+                    logger.warning(
+                        "Subagent %d required-output retry turn failed: %s",
+                        task_index,
+                        _retry_exc,
+                    )
+                if isinstance(_retry_result, dict):
+                    _retry_text = _retry_result.get("final_response") or ""
+                    if _retry_text.strip():
+                        result["final_response"] = _retry_text
+                    try:
+                        result["api_calls"] = int(
+                            result.get("api_calls", 0) or 0
+                        ) + int(_retry_result.get("api_calls", 0) or 0)
+                    except (TypeError, ValueError):
+                        pass
+                    _retry_messages = _retry_result.get("messages")
+                    if isinstance(_retry_messages, list) and isinstance(
+                        result.get("messages"), list
+                    ):
+                        result["messages"] = result["messages"] + _retry_messages
+                    _required_outputs_valid, _required_outputs_errors = (
+                        validate_required_outputs(_retry_text, _required_outputs)
+                    )
+
         # Linearization boundary for registry steering. From this point on the
         # child cannot consume another steer. Closing under the registry lock
         # either rejects a concurrent caller or drains every previously accepted
@@ -2567,7 +2624,11 @@ def _run_single_child(
 
         if interrupted:
             status = "interrupted"
-        elif summary and not _empty_sentinel:
+        elif (
+            summary
+            and not _empty_sentinel
+            and _required_outputs_valid is not False
+        ):
             # A summary means the subagent produced usable output.
             # exit_reason ("completed" vs "max_iterations") already
             # tells the parent *how* the task ended.
@@ -2673,7 +2734,14 @@ def _run_single_child(
             else "unknown"
         )
         if status == "failed":
-            entry["error"] = result.get("error", "Subagent did not produce a response.")
+            if _required_outputs_valid is False:
+                entry["error"] = (
+                    "Subagent final report did not address every required scout output."
+                )
+            else:
+                entry["error"] = result.get(
+                    "error", "Subagent did not produce a response."
+                )
 
         # T1-24: schema-validation outcome — emitted ONLY when a schema was
         # requested, so legacy (schema-less) payloads keep their exact shape.
@@ -2683,6 +2751,12 @@ def _run_single_child(
                 entry["schema_retries"] = _schema_retries
             if not _schema_valid and _schema_errors:
                 entry["schema_errors"] = _schema_errors
+        if isinstance(_required_outputs, list) and _required_outputs:
+            entry["required_outputs_valid"] = bool(_required_outputs_valid)
+            if _required_outputs_retries:
+                entry["required_outputs_retries"] = _required_outputs_retries
+            if not _required_outputs_valid and _required_outputs_errors:
+                entry["required_outputs_errors"] = _required_outputs_errors
 
         # A steer that queued after the child's final assistant turn had no
         # tool batch left to drain into.  The finalizer hands the undelivered
@@ -3232,6 +3306,7 @@ def delegate_task(
     role: Optional[str] = None,
     background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None,
+    required_outputs: Optional[List[str]] = None,
     route: Optional[str] = None,
     parent_agent=None,
 ) -> str:
@@ -3288,6 +3363,7 @@ def delegate_task(
 
     # Resolve one call-level operator route before any child is built.
     cfg = _load_config()
+    selected_route = route if route is not None else cfg.get("default_route")
     try:
         cfg, route_toolsets = _resolve_delegation_route(cfg, route)
     except ValueError as exc:
@@ -3338,6 +3414,8 @@ def delegate_task(
         single_task: Dict[str, Any] = {"goal": goal, "context": context, "role": top_role}
         if output_schema is not None:
             single_task["output_schema"] = output_schema
+        if required_outputs is not None:
+            single_task["required_outputs"] = required_outputs
         task_list = [single_task]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
@@ -3380,6 +3458,34 @@ def delegate_task(
         if schema_err:
             return tool_error(f"Task {i} output_schema invalid: {schema_err}")
         task_schemas.append(coerced_schema)
+
+    # A scout must name its discovery outputs before dispatch. This gives the
+    # completion path a deterministic contract instead of asking it to infer
+    # intent from free-form goal prose.
+    from tools.delegation_required_outputs import coerce_required_outputs
+
+    task_required_outputs: List[List[str]] = []
+    is_scout_route = isinstance(selected_route, str) and selected_route.strip() == "scout"
+    for i, task in enumerate(task_list):
+        raw_outputs = task.get("required_outputs")
+        if raw_outputs is None and len(task_list) == 1 and required_outputs is not None:
+            raw_outputs = required_outputs
+        outputs, outputs_err = coerce_required_outputs(raw_outputs)
+        if outputs_err:
+            return tool_error(f"Task {i} required_outputs invalid: {outputs_err}")
+        if is_scout_route and outputs is None:
+            return tool_error(
+                f"Task {i} uses the scout route but has no required_outputs. "
+                "Name each discovery output that the final report must address."
+            )
+        if is_scout_route and task_schemas[i] is not None:
+            return tool_error(
+                f"Task {i} cannot combine scout required_outputs with output_schema. "
+                "Use the named scout report contract only."
+            )
+        if not is_scout_route and outputs is not None:
+            return tool_error("required_outputs is supported only by the scout route.")
+        task_required_outputs.append(outputs or [])
 
     overall_start = time.monotonic()
     results = []
@@ -3437,11 +3543,18 @@ def delegate_task(
         # T1-24: schema'd tasks get the contract appended to their context
         # so the child knows the expected output shape before it starts.
         _task_schema = task_schemas[i] if i < len(task_schemas) else None
+        _task_required_outputs = task_required_outputs[i]
         _child_context = t.get("context")
         if _task_schema is not None:
             from tools.delegation_output_schema import append_output_contract
 
             _child_context = append_output_contract(_child_context, _task_schema)
+        if _task_required_outputs:
+            from tools.delegation_required_outputs import append_required_outputs_contract
+
+            _child_context = append_required_outputs_contract(
+                _child_context, _task_required_outputs
+            )
         child = _build_child_preserving_parent_tools(
             task_index=i,
             goal=t["goal"],
@@ -3473,6 +3586,8 @@ def delegate_task(
                 child._delegate_output_schema = _task_schema
             except Exception:
                 logger.debug("Could not attach output schema to child %d", i)
+        if _task_required_outputs:
+            child._delegate_required_outputs = _task_required_outputs
         # Tee the child's progress events into its live transcript log.
         # wrap_progress_callback preserves the inner callback contract
         # (including the _flush attribute) and never lets writer failures
@@ -4336,6 +4451,17 @@ DELEGATE_TASK_SCHEMA = {
                     "route applies to every child in this call, including batches."
                 ),
             },
+            "required_outputs": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Required for the single-goal scout route. Name each "
+                    "discovery output that the final report must address. The "
+                    "scout must use every exact name as a non-empty Markdown "
+                    "section heading; the parent validates the report and "
+                    "allows one bounded correction retry."
+                ),
+            },
             "tasks": {
                 "type": "array",
                 "items": {
@@ -4362,6 +4488,15 @@ DELEGATE_TASK_SCHEMA = {
                                 "gains schema_valid (and schema_errors on "
                                 "final failure). Keep schemas forgiving: "
                                 "require only fields you will actually read."
+                            ),
+                        },
+                        "required_outputs": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": (
+                                "Required per-task discovery output names for "
+                                "a scout-route batch. See top-level "
+                                "required_outputs for validation semantics."
                             ),
                         },
                     },
@@ -4455,6 +4590,7 @@ registry.register(
         context=args.get("context"),
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         route=args.get("route"),
+        required_outputs=args.get("required_outputs"),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")),

@@ -208,6 +208,25 @@ is omitted, Hermes uses `delegation.default_route` if configured. With neither
 a call route nor a default route, delegation behaves as before. Unknown or
 invalid selected routes fail before any child starts.
 
+The `scout` route also requires the caller to name the expected discovery
+outputs. Use `required_outputs` with the single-goal form, or add it to each
+task in a batch:
+
+```python
+delegate_task(
+    goal="Trace the cache input contract",
+    route="scout",
+    required_outputs=["Range formulas", "Manifest facts"],
+)
+```
+
+The scout's final report must use each exact name as a Markdown heading and put
+a substantive answer under it. Hermes validates the report. If a heading is
+missing or empty, Hermes gives the scout one correction turn. A second invalid
+report fails instead of passing as a generic non-empty summary. The route still
+uses its configured read-only toolset; report validation does not add write
+capabilities.
+
 ## Inherited Tool Access
 
 `delegate_task` does not accept a model-facing `toolsets` parameter. Each
