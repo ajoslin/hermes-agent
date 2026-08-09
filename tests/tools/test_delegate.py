@@ -67,7 +67,11 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("tasks", props)
         self.assertIn("context", props)
         self.assertEqual(props["route"]["type"], "string")
+        self.assertEqual(props["required_outputs"]["type"], "array")
         self.assertNotIn("route", props["tasks"]["items"]["properties"])
+        self.assertIn(
+            "required_outputs", props["tasks"]["items"]["properties"]
+        )
         # toolsets is intentionally NOT exposed to the model — subagents always
         # inherit the parent's toolsets. Letting the model name toolsets was a
         # capability-selection surface the model should not control.
@@ -735,7 +739,7 @@ class TestDelegationRoutes(unittest.TestCase):
         parent._credential_pool = None
         child = MagicMock()
         child.run_conversation.return_value = {
-            "final_response": "done",
+            "final_response": "# File findings\nThe file contains the requested data.",
             "completed": True,
             "api_calls": 1,
             "messages": [],
@@ -775,6 +779,7 @@ class TestDelegationRoutes(unittest.TestCase):
                 delegate_task(
                     goal="Read one file",
                     route="scout",
+                    required_outputs=["File findings"],
                     background=False,
                     parent_agent=parent,
                 )
@@ -785,6 +790,26 @@ class TestDelegationRoutes(unittest.TestCase):
         self.assertTrue(build_child.call_args.kwargs["strict_toolsets"])
         self.assertNotIn("model", build_child.call_args.kwargs["delegation_cfg"])
         self.assertEqual(child._delegate_child_timeout, 60.0)
+
+    def test_scout_without_named_outputs_fails_before_child_construction(self):
+        parent = _make_mock_parent()
+        with (
+            patch(
+                "tools.delegate_tool._load_config",
+                return_value={"routes": {"scout": {}}},
+            ),
+            patch("tools.delegate_tool._build_child_preserving_parent_tools") as build_child,
+        ):
+            result = json.loads(
+                delegate_task(
+                    goal="Inspect the repository",
+                    route="scout",
+                    parent_agent=parent,
+                )
+            )
+
+        self.assertIn("has no required_outputs", result["error"])
+        build_child.assert_not_called()
 
     def test_unknown_route_fails_before_child_construction(self):
         parent = _make_mock_parent()
@@ -1401,6 +1426,7 @@ class TestDispatchDelegateTask(unittest.TestCase):
                 {
                     "goal": "test",
                     "route": "scout",
+                    "required_outputs": ["Exact findings"],
                     "acp_command": "claude",
                     "acp_args": ["--acp", "--stdio"],
                     "tasks": [
@@ -1417,6 +1443,7 @@ class TestDispatchDelegateTask(unittest.TestCase):
         self.assertNotIn("acp_args", captured)
         self.assertEqual(captured["goal"], "test")
         self.assertEqual(captured["route"], "scout")
+        self.assertEqual(captured["required_outputs"], ["Exact findings"])
         self.assertNotIn("acp_command", captured["tasks"][0])
         self.assertNotIn("acp_args", captured["tasks"][0])
 
